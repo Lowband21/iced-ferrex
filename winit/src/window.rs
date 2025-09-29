@@ -2,6 +2,9 @@ mod state;
 
 use state::State;
 
+#[cfg(all(target_os = "linux", feature = "wayland-hack"))]
+pub use crate::wayland_integration::wayland;
+
 pub use crate::core::window::{Event, Id, RedrawRequest, Settings};
 
 use crate::conversion;
@@ -69,6 +72,10 @@ where
 
         let _ = self.aliases.insert(window.id(), id);
 
+        #[cfg(all(target_os = "linux", feature = "wayland-hack"))]
+        let wayland_integration =
+            wayland::WaylandIntegration::from_window(&window);
+
         let _ = self.entries.insert(
             id,
             Window {
@@ -82,6 +89,8 @@ where
                 redraw_at: None,
                 preedit: None,
                 ime_state: None,
+                #[cfg(all(target_os = "linux", feature = "wayland-hack"))]
+                wayland_integration,
             },
         );
 
@@ -173,6 +182,8 @@ where
     pub redraw_at: Option<Instant>,
     preedit: Option<Preedit<P::Renderer>>,
     ime_state: Option<(Rectangle, input_method::Purpose)>,
+    #[cfg(all(target_os = "linux", feature = "wayland-hack"))]
+    pub wayland_integration: Option<wayland::WaylandIntegration>,
 }
 
 impl<P, C> Window<P, C>
@@ -301,6 +312,11 @@ where
         }
 
         self.preedit = None;
+    }
+
+    #[cfg(all(target_os = "linux", feature = "wayland-hack"))]
+    pub fn wayland_integration(&self) -> Option<&wayland::WaylandIntegration> {
+        self.wayland_integration.as_ref()
     }
 }
 
