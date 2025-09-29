@@ -45,6 +45,12 @@ mod image;
 #[path = "image/null.rs"]
 mod image;
 
+#[cfg(any(feature = "image", feature = "svg"))]
+pub use image::AtlasRegion;
+
+#[cfg(any(feature = "image", feature = "svg"))]
+pub use image::Cache as ImageCache;
+
 use buffer::Buffer;
 
 use iced_debug as debug;
@@ -68,6 +74,7 @@ use crate::core::{
 use crate::graphics::mesh;
 use crate::graphics::text::{Editor, Paragraph};
 use crate::graphics::{Shell, Viewport};
+use crate::primitive::{BatchResources, BatchResourcesMut};
 
 /// A [`wgpu`] graphics renderer for [`iced`].
 ///
@@ -142,6 +149,16 @@ impl Renderer {
                 label: Some("iced_wgpu encoder"),
             },
         );
+
+        {
+            let mut primitive_storage = self
+                .engine
+                .primitive_storage
+                .write()
+                .expect("Write primitive storage");
+
+            primitive_storage.begin_frame();
+        }
 
         self.prepare(&mut encoder, viewport);
         self.render(&mut encoder, target, clear_color, viewport);
@@ -279,10 +296,15 @@ impl Renderer {
         let slice = output_buffer.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
 
-        let _ = self.engine.device.poll(wgpu::PollType::Wait {
+        if let Err(error) = self.engine.device.poll(wgpu::PollType::Wait {
             submission_index: Some(index),
             timeout: None,
-        });
+        }) {
+            log::error!(
+                "Failed to poll device while capturing screenshot: {error}"
+            );
+            return Vec::new();
+        }
 
         let mapped_buffer = slice.get_mapped_range();
 
@@ -311,9 +333,8 @@ impl Renderer {
 
         self.layers.merge();
 
-        for layer in self.layers.iter() {
+        for (layer_index, layer) in self.layers.iter().enumerate() {
             let clip_bounds = layer.bounds * scale_factor;
-
             if physical_bounds
                 .intersection(&clip_bounds)
                 .and_then(Rectangle::snap)
@@ -363,6 +384,8 @@ impl Renderer {
                     .write()
                     .expect("Write primitive storage");
 
+                primitive_storage.begin_layer(layer_index);
+
                 for instance in &layer.primitives {
                     instance.primitive.prepare(
                         &mut primitive_storage,
@@ -373,6 +396,8 @@ impl Renderer {
                         viewport,
                     );
                 }
+
+                primitive_storage.end_layer(layer_index);
 
                 prepare_span.finish();
             }
@@ -410,6 +435,45 @@ impl Renderer {
                 );
 
                 prepare_span.finish();
+            }
+        }
+
+        {
+            let mut primitive_storage = self
+                .engine
+                .primitive_storage
+                .write()
+                .expect("Write primitive storage");
+
+            #[cfg(any(feature = "svg", feature = "image"))]
+            {
+                let mut image_cache = self.image_cache.borrow_mut();
+                let mut resources = BatchResourcesMut {
+                    image_cache: Some(&mut *image_cache),
+                };
+
+                primitive_storage.prepare_batches(
+                    &self.engine.device,
+                    encoder,
+                    &mut self.staging_belt,
+                    &mut resources,
+                    viewport,
+                    scale_factor,
+                );
+            }
+
+            #[cfg(not(any(feature = "svg", feature = "image")))]
+            {
+                let mut resources = BatchResourcesMut::default();
+
+                primitive_storage.prepare_batches(
+                    &self.engine.device,
+                    encoder,
+                    &mut self.staging_belt,
+                    &mut resources,
+                    viewport,
+                    scale_factor,
+                );
             }
         }
     }
@@ -469,14 +533,30 @@ impl Renderer {
 
         let scale = Transformation::scale(scale_factor);
 
-        for layer in self.layers.iter() {
-            let Some(physical_bounds) =
+        for (layer_index, layer) in self.layers.iter().enumerate() {
+            let has_primitives = !layer.primitives.is_empty();
+
+            let discard_layer_batches = || {
+                if has_primitives {
+                    let mut primitive_storage = self
+                        .engine
+                        .primitive_storage
+                        .write()
+                        .expect("Write primitive storage");
+
+                    primitive_storage.drop_layer_segments(layer_index);
+                }
+            };
+
+            let Some(layer_bounds) =
                 physical_bounds.intersection(&(layer.bounds * scale_factor))
             else {
+                discard_layer_batches();
                 continue;
             };
 
-            let Some(scissor_rect) = physical_bounds.snap() else {
+            let Some(scissor_rect) = layer_bounds.snap() else {
+                discard_layer_batches();
                 continue;
             };
 
@@ -504,7 +584,7 @@ impl Renderer {
                     frame,
                     mesh_layer,
                     &layer.triangles,
-                    physical_bounds,
+                    layer_bounds,
                     scale,
                 );
                 render_span.finish();
@@ -533,11 +613,11 @@ impl Renderer {
             if !layer.primitives.is_empty() {
                 let render_span = debug::render(debug::Primitive::Shader);
 
-                let primitive_storage = self
+                let mut primitive_storage = self
                     .engine
                     .primitive_storage
-                    .read()
-                    .expect("Read primitive storage");
+                    .write()
+                    .expect("Write primitive storage");
 
                 let mut need_render = Vec::new();
 
@@ -545,7 +625,7 @@ impl Renderer {
                     let bounds = instance.bounds * scale;
 
                     if let Some(clip_bounds) = (instance.bounds * scale)
-                        .intersection(&physical_bounds)
+                        .intersection(&layer_bounds)
                         .and_then(Rectangle::snap)
                     {
                         render_pass.set_viewport(
@@ -623,6 +703,23 @@ impl Renderer {
                     ));
                 }
 
+                #[cfg(any(feature = "svg", feature = "image"))]
+                let image_cache_ref = self.image_cache.borrow();
+                #[cfg(any(feature = "svg", feature = "image"))]
+                let resources = BatchResources {
+                    image_cache: Some(&*image_cache_ref),
+                };
+
+                #[cfg(not(any(feature = "svg", feature = "image")))]
+                let resources = BatchResources::default();
+
+                primitive_storage.render_layer_batches(
+                    layer_index,
+                    &mut render_pass,
+                    &resources,
+                    scissor_rect,
+                );
+
                 render_span.finish();
             }
 
@@ -654,7 +751,30 @@ impl Renderer {
             }
         }
 
+        debug_assert!(
+            {
+                let primitive_storage = self
+                    .engine
+                    .primitive_storage
+                    .read()
+                    .expect("Read primitive storage");
+
+                !primitive_storage.has_pending_layer_segments()
+            },
+            "primitive batch segments remained after per-layer rendering"
+        );
+
         let _ = ManuallyDrop::into_inner(render_pass);
+
+        {
+            let mut primitive_storage = self
+                .engine
+                .primitive_storage
+                .write()
+                .expect("Write primitive storage");
+
+            primitive_storage.trim_batches();
+        }
 
         debug::layers_rendered(|| {
             self.layers

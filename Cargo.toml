@@ -89,6 +89,10 @@ linux-theme-detection = ["iced_winit/linux-theme-detection"]
 x11 = ["iced_renderer/x11", "iced_winit/x11"]
 # Enables the Unix Wayland backend
 wayland = ["iced_renderer/wayland", "iced_winit/wayland"]
+# Enables renderer-driven batching for custom primitives
+batch = ["iced_wgpu/batch", "dep:image"]
+# Enables Wayland-specific compositor hooks for subsurface integrations
+wayland-hack = ["iced_winit/wayland-hack"]
 
 [dependencies]
 iced_debug.workspace = true
