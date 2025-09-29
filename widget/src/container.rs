@@ -459,6 +459,7 @@ pub fn draw_background<Renderer>(
 
 /// The appearance of a container.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Default)]
 pub struct Style {
     /// The text [`Color`] of the container.
     pub text_color: Option<Color>,
@@ -472,17 +473,6 @@ pub struct Style {
     pub snap: bool,
 }
 
-impl Default for Style {
-    fn default() -> Self {
-        Self {
-            text_color: None,
-            background: None,
-            border: Border::default(),
-            shadow: Shadow::default(),
-            snap: cfg!(feature = "crisp"),
-        }
-    }
-}
 
 impl Style {
     /// Updates the text color of the [`Style`].
